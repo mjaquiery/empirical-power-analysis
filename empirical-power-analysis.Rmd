@@ -1,0 +1,243 @@
+---
+title: "Empirical Power Analysis"
+author: "Matt Jaquiery"
+date: "09/03/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = F,
+  warning = F,
+  message = F
+  )
+library(parallel)
+library(tidyverse)
+library(kableExtra)
+# devtools::install_github('mjaquiery/prettyMD')
+library(prettyMD)
+
+# GGplot theme
+theme_set(theme_light() + 
+            theme(
+              panel.grid = element_blank(),
+              legend.position = 'top'
+            ))
+
+# Define the power function
+#' Determine the power of FUN evaluated at ns/effect_sizes
+#' @param ns vector of sample sizes
+#' @param effect_sizes vector of effect sizes to be crossed with sample sizes
+#' @param FUN function to evaluate. Must be a function name string if n_cores is 
+#'  > 1. Will be called with arguments n, effect_sizes, the combination id, ...
+#' @param iterations number of iterations to run of each combination
+#' @param n_cores if > 1 the FUN calls will be made in parallel 
+#' @param ... additional arguments passed to FUN
+#'
+#' @details The combination id is used to allow complex FUNs to access the 
+#'  appropriate parts of ... arguments where they are vectors. ns and 
+#'  effect_sizes are crossed to produce the combinations to examine. These are 
+#'  then given sequential combination ids, so the first n and effect size will 
+#'  be 1, first n and second effect size will be 2, second n and first effect
+#'  size will be length(ns)+1, etc.
+#'
+#' @return a tbl with length(ns) x length(effect_sizes) x length(iterations) 
+#'  rows and four columns: n, effect_size, iteration, p-value
+analyse_power <- function(ns, effect_sizes, FUN, iterations, n_cores = 1, ...) {
+  if (n_cores > 1 && !is.character(FUN)) 
+    stop('When running in parallel (n_cores > 1), FUN must be a function name.')
+  
+  cases <- crossing(n = ns, effect_size = effect_sizes)
+  cases <- cases %>% rowid_to_column('combination_id') %>% 
+    select(n, effect_size, combination_id)
+  cases <- crossing(cases, iteration = 1:iterations)
+  
+  f <- function(x) do.call(FUN, list(x[1], x[2], x[3]))
+  
+  if (n_cores > 1) {
+    cl <- makeCluster(n_cores)
+    clusterExport(cl, FUN)
+    out <- parApply(cl, cases, 1, FUN = f, ...) %>% bind_rows()
+    stopCluster(cl)
+  } else {
+    out <- cases %>% apply(1, f) %>% bind_rows()
+  }
+  
+  out
+}
+```
+
+## Introduction
+
+Decision | $H_0$ = TRUE | $H_1$ = TRUE
+---------|--------------|--------------
+Reject $H_0$ | Type 1 error ($p = \alpha$) | Correct rejection ($p = 1 - \beta$)
+Accept $H_0$ | Correct ($p = 1 - \alpha$) | Type 2 error ($p = \beta$)
+($\alpha$ = long-term false-positive rate; $\beta$ = long-term false-negative rate)
+
+The contingency table above demonstrates how the empirical power analysis presented below will work. We will be simulating data, so we will be controlling whether or not $H_0$ is true. This means that we'll be looking at one column at a time, and will thus be able to determine the empirical $\alpha$ and $\beta$ values from the proportion of $H_0$ rejections.
+
+## Simulation
+
+We are going to set up a general purpose power curve/heatmap workflow which will take any function and call it repeatedly with the arguments of sample size and effect size. To keep things simple we'll write a wrapper for simulating t-test data, but this can be arbitrarily complex.
+
+The wrapper function generates two sets of $n$ observations from normal distributions with standard deviations = 1 and means = to 0 and $\text{effect_size}$. It then performs an independent samples t-test on these sets and reports the p-value.
+
+```{r}
+
+# This function should match the input and output structure we'll expect:
+#' Simulate an independent samples t-test.
+#' @param n number of samples in each group
+#' @param effect_size difference between group means
+#' @param combination number for this n+effect_size combination
+#' @return tbl of n, effect_size, combination, p.value from t-test
+sim_t_test <- function(n, effect_size, combination) {
+  r <- t.test(
+    rnorm(n),
+    rnorm(n, effect_size)
+  )
+  data.frame(n, effect_size, combination, p = r$p.value)
+}
+
+```
+
+When we call this function we get the parameters we gave it (sample size, effect size, and a combination id) as well as a p-value of the t-test run on the simulated data:
+
+```{r comment = ''}
+as_tibble(sim_t_test(n = 30, effect_size = .9, combination = NA))
+```
+
+## Power curve
+
+Now we can simulate data, we can construct a power curve by inspecting p-values for several different sample sizes:
+
+```{r comment = ''}
+
+# This is the basic form we use to run multiple simulations
+r <- analyse_power(
+  ns = 5:25,             # produces a vector of 5, 6, 7,... 20
+  effect_sizes = .9,     # only use a single effect size for now
+  FUN = "sim_t_test",    # specify the t-test wrapper we made above
+  iterations = 1         # only run one iteration at each effect size
+  )
+
+r %>% mutate(p = prop2str(p))
+
+```
+
+We can plot these p-values against the sample size which generated them.
+
+```{r}
+
+ggplot(r, aes(x = n, y = p)) +
+  geom_hline(yintercept = .05, linetype = 'dashed') +
+  geom_point() +
+  geom_smooth(se = F) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = paste0(
+    "P-value curve for t-testing distributions with mean difference = ", 
+    r$effect_size[1]),
+    x = "Sample size",
+    y = "p-value"
+    )
+
+```
+
+As we can see, there's a bit of a scattering of p-values. We can get a better picture of what's going on by running multiple copies (100) of each simulation. 
+
+```{r}
+r <- analyse_power(
+  ns = 5:25,                  # produces a vector of 5, 6, 7,... 20
+  effect_sizes = .9,          # only use a single effect size for now
+  FUN = "sim_t_test",         # specify the t-test wrapper we made above
+  iterations = 100,           # 100 runs at each effect size
+  n_cores = detectCores() - 4 # run in parallel
+  )
+
+ggplot(r, aes(x = n, y = p)) +
+  geom_hline(yintercept = .05, linetype = 'dashed') +
+  geom_point(position = position_jitter(.33), alpha = .2) +
+  geom_smooth(se = F) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = paste0(
+    "P-value curve for t-testing distributions with mean difference = ", 
+    r$effect_size[1]),
+    x = "Sample size",
+    y = "p-value"
+    )
+```
+
+We're now starting to see the power curve emerge over the 100 runs at each sample size. We can see what this would look like with a smaller effect size, too.
+
+```{r}
+r <- analyse_power(
+  ns = 5:25,              
+  effect_sizes = c(.3, .6, .9),
+  FUN = "sim_t_test",     
+  iterations = 100,       
+  n_cores = detectCores() - 4
+)
+
+r <- r %>% mutate(effect_size = factor(effect_size),
+                  `p < .05` = p < .05)
+
+ggplot(r, aes(x = n, y = p, colour = effect_size)) +
+  geom_hline(yintercept = .05, linetype = 'dashed') +
+  geom_point(position = position_jitter(.33), alpha = .2) +
+  geom_smooth(se = F) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "P-value curves",
+    x = "Sample size",
+    y = "p-value"
+    ) +
+  facet_wrap(~effect_size, labeller = label_both)
+```
+
+## Heatmap
+
+We can collapse these observations into the manifold represented by the line - a vector of values expressing the relationship between the mean p-value and the sample size. Better still, we can take the closely related manifold expressing the proportion of the t-tests which had p-values < .05. 
+
+With our 2d space collapsed to a 1d space, we can add in an extra dimension which we can use to vary the effect size. Our current data represented in this format looks like this:
+
+```{r}
+
+rx <- r %>%
+  group_by(n, effect_size) %>%
+  summarise(`p(p < .05)` = mean(p < .05))
+
+ggplot(rx, aes(x = n, y = effect_size, fill = `p(p < .05)`)) +
+  geom_tile() +
+  geom_text(aes(label = prop2str(`p(p < .05)`, precision = 2), 
+                colour = effect_size)) +
+  scale_fill_viridis_c(limits = c(0, 1), option = 'plasma') +
+  scale_colour_discrete(guide = 'none') +
+  coord_fixed(.5) +
+  labs(x = "Sample size", 
+       y = "Effect size")
+
+```
+
+We are now in a position to simulate this with many iterations (1000 per cell) and many different levels of effect size. We will also add *s where the power is > .85 so we can identify sample sizes we might want to adopt at each effect size.
+
+```{r}
+
+rx <- analyse_power(
+  ns = seq(5, 50, 2),              
+  effect_sizes = seq(0, 1.5, .1),
+  FUN = "sim_t_test",     
+  iterations = 1000,       
+  n_cores = detectCores() - 4
+) %>%
+  group_by(n, effect_size) %>%
+  summarise(`p(p < .05)` = mean(p < .05))
+
+ggplot(rx, aes(x = n, y = effect_size, fill = `p(p < .05)`)) +
+  geom_tile() +
+  geom_text(label = "*", colour = 'red', 
+            data = rx %>% filter(`p(p < .05)` >= .85)) +
+  scale_fill_viridis_c(limits = c(0, 1), option = 'plasma') +
+  labs(x = "Sample size", 
+       y = "Effect size",
+       caption = "* = 85%+ power")
+
+```
